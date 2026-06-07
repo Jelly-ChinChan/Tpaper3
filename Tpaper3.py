@@ -103,9 +103,11 @@ def analyze_faded_white_area(
     img_rgb: Image.Image,
     circle_mask: np.ndarray,
     manual_threshold=None,
-    white_bias=0.0
+    white_bias=0.0,
+    inner_ratio=0.78
 ):
     arr = np.array(img_rgb).astype(np.float32)
+    h, w, _ = arr.shape
 
     R = arr[:, :, 0]
     G = arr[:, :, 1]
@@ -122,15 +124,38 @@ def analyze_faded_white_area(
     # 藍色區：亮度低、藍色指數高
     white_score = gray - blue_index + white_bias
 
-    valid_white_score = white_score[circle_mask]
+    # 從圓形遮罩反推圓心與半徑
+    ys, xs = np.where(circle_mask)
+
+    if len(xs) == 0:
+        cx = w // 2
+        cy = h // 2
+        r = min(w, h) // 2
+    else:
+        cx = int((xs.min() + xs.max()) / 2)
+        cy = int((ys.min() + ys.max()) / 2)
+        r = int(min(xs.max() - xs.min(), ys.max() - ys.min()) / 2)
+
+    yy, xx = np.ogrid[:h, :w]
+
+    # 只允許中心內圈被判斷為褪色區
+    # 試劑從中心滴入，因此外圈不應該被判定為紅色褪色區
+    inner_mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= (r * inner_ratio) ** 2
+
+    analysis_area = circle_mask & inner_mask
+
+    valid_white_score = white_score[analysis_area]
 
     if manual_threshold is None:
         threshold = otsu_threshold(valid_white_score)
     else:
         threshold = manual_threshold
 
-    faded_mask = (white_score > threshold) & circle_mask
-    blue_mask = (~faded_mask) & circle_mask
+    # 紅色褪色區：必須同時符合白色分數高 + 位於中心內圈
+    faded_mask = (white_score > threshold) & analysis_area
+
+    # 黃色剩餘藍色區：整個圓形試紙扣掉中心褪色區
+    blue_mask = circle_mask & (~faded_mask)
 
     faded_count = int(faded_mask.sum())
     blue_count = int(blue_mask.sum())
@@ -144,6 +169,8 @@ def analyze_faded_white_area(
         "blue_index": blue_index,
         "white_score": white_score,
         "threshold": threshold,
+        "inner_mask": inner_mask,
+        "analysis_area": analysis_area,
         "faded_mask": faded_mask,
         "blue_mask": blue_mask,
         "faded_count": faded_count,
@@ -155,7 +182,14 @@ def analyze_faded_white_area(
 
 
 # ---------- 製作分析疊圖 ----------
-def make_overlay(img_rgb, circle_mask, blue_edge_mask, blue_mask, faded_mask):
+def make_overlay(
+    img_rgb,
+    circle_mask,
+    blue_edge_mask,
+    blue_mask,
+    faded_mask,
+    inner_mask=None
+):
     arr = np.array(img_rgb).astype(np.float32)
     overlay = arr.copy()
 
@@ -185,7 +219,32 @@ def make_overlay(img_rgb, circle_mask, blue_edge_mask, blue_mask, faded_mask):
         + 0.65 * np.array([255, 255, 0])
     )
 
+    # 可選：中心內圈邊界用淡白線提示
+    if inner_mask is not None:
+        boundary = get_mask_boundary(inner_mask)
+        overlay[boundary] = np.array([255, 255, 255])
+
     return overlay.clip(0, 255).astype(np.uint8)
+
+
+# ---------- 找遮罩邊界 ----------
+def get_mask_boundary(mask: np.ndarray):
+    h, w = mask.shape
+
+    up = np.zeros_like(mask)
+    down = np.zeros_like(mask)
+    left = np.zeros_like(mask)
+    right = np.zeros_like(mask)
+
+    up[:-1, :] = mask[1:, :]
+    down[1:, :] = mask[:-1, :]
+    left[:, :-1] = mask[:, 1:]
+    right[:, 1:] = mask[:, :-1]
+
+    inner = mask & up & down & left & right
+    boundary = mask & (~inner)
+
+    return boundary
 
 
 # ================= Streamlit UI =================
@@ -193,7 +252,12 @@ st.title("🧪 圓形鉬藍試紙白色褪色面積分析")
 
 st.write(
     "本程式會自動偵測圓形試紙，排除桌面背景，"
-    "並以「白色分數」判斷褪色區，避免把陰影中的藍色誤判成褪色。"
+    "並以「白色分數」判斷中心褪色區。"
+)
+
+st.info(
+    "判斷原則：因為試劑從中心滴入，所以紅色褪色區只允許出現在中心內圈；"
+    "外圈邊緣即使偏亮，也不會被判定為褪色。"
 )
 
 uploaded_file = st.file_uploader(
@@ -209,7 +273,7 @@ if uploaded_file:
 
     st.subheader("2) 自動偵測圓形試紙")
 
-    with st.expander("進階設定：通常不需要調整", expanded=False):
+    with st.expander("進階設定：圓形試紙偵測", expanded=False):
         blue_b_min = st.slider(
             "偵測外圈：B 通道最低值",
             0, 255, 70
@@ -234,24 +298,16 @@ if uploaded_file:
 
     st.info(f"自動偵測結果：圓心 = ({cx}, {cy})，半徑 = {r} px")
 
-    st.subheader("3) 白色褪色區判斷")
+    st.subheader("3) 中心褪色區判斷")
 
-    auto_result = analyze_faded_white_area(
-        img,
-        circle_mask,
-        manual_threshold=None,
-        white_bias=0.0
-    )
-
-    with st.expander("進階設定：手動調整白色判斷閾值", expanded=False):
-        use_manual = st.checkbox("使用手動閾值", value=False)
-
-        manual_threshold = st.slider(
-            "White Score 閾值",
-            0.0,
-            255.0,
-            float(auto_result["threshold"]),
-            1.0
+    with st.expander("進階設定：中心褪色區限制", expanded=False):
+        inner_ratio = st.slider(
+            "褪色區允許範圍：中心內圈比例",
+            0.50,
+            0.95,
+            0.78,
+            0.01,
+            help="試劑從中心滴入，褪色區應主要出現在中心。數值越小，越不會把外圈邊緣誤判成褪色。"
         )
 
         white_bias = st.slider(
@@ -262,51 +318,69 @@ if uploaded_file:
             1.0
         )
 
+    auto_result = analyze_faded_white_area(
+        img,
+        circle_mask,
+        manual_threshold=None,
+        white_bias=white_bias,
+        inner_ratio=inner_ratio
+    )
+
+    with st.expander("進階設定：手動調整 White Score 閾值", expanded=False):
+        use_manual = st.checkbox("使用手動閾值", value=False)
+
+        manual_threshold = st.slider(
+            "White Score 閾值",
+            0.0,
+            255.0,
+            float(auto_result["threshold"]),
+            1.0
+        )
+
     if use_manual:
         result = analyze_faded_white_area(
             img,
             circle_mask,
             manual_threshold=manual_threshold,
-            white_bias=white_bias
+            white_bias=white_bias,
+            inner_ratio=inner_ratio
         )
     else:
-        result = analyze_faded_white_area(
-            img,
-            circle_mask,
-            manual_threshold=None,
-            white_bias=white_bias
-        )
+        result = auto_result
 
     st.write(f"目前 White Score 閾值：**{result['threshold']:.2f}**")
+    st.write(f"目前中心內圈比例：**{inner_ratio:.2f}**")
 
     overlay = make_overlay(
         img,
         circle_mask,
         blue_edge_mask,
         result["blue_mask"],
-        result["faded_mask"]
+        result["faded_mask"],
+        inner_mask=result["inner_mask"]
     )
 
     st.subheader("4) AI 自動選區與分析結果")
 
     st.image(
         Image.fromarray(overlay),
-        caption="黃色=剩餘藍色區，紅色=白色褪色區，變暗區=桌面不計算",
+        caption="黃色=剩餘藍色區，紅色=中心白色褪色區，白線=允許判斷褪色的中心範圍，變暗區=桌面不計算",
         use_container_width=True
     )
 
     st.success(
         f"✅ 剩餘藍色面積比例：**{result['blue_ratio']:.2%}**　｜　"
-        f"白色褪色面積比例：**{result['faded_ratio']:.2%}**"
+        f"中心白色褪色面積比例：**{result['faded_ratio']:.2%}**"
     )
 
     st.subheader("5) 數值摘要")
 
     st.write(
         f"- Blue pixels：{result['blue_count']}\n"
-        f"- Faded white pixels：{result['faded_count']}\n"
+        f"- Center faded white pixels：{result['faded_count']}\n"
         f"- Total counted pixels：{result['total']}\n"
         f"- Blue ratio：{result['blue_ratio']:.4f}\n"
-        f"- Faded white ratio：{result['faded_ratio']:.4f}\n"
-        f"- White Score threshold：{result['threshold']:.2f}"
+        f"- Center faded white ratio：{result['faded_ratio']:.4f}\n"
+        f"- White Score threshold：{result['threshold']:.2f}\n"
+        f"- Inner ratio：{inner_ratio:.2f}"
     )
