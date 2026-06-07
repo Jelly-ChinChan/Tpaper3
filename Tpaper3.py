@@ -5,10 +5,6 @@ import numpy as np
 
 # ---------- Otsu 閾值 ----------
 def otsu_threshold(arr: np.ndarray) -> float:
-    """
-    arr: 任意數值陣列，會自動轉成 0~255 做 Otsu
-    return: 對應回原始數值尺度的 threshold
-    """
     values = arr.ravel().astype(np.float64)
 
     if values.size == 0:
@@ -33,10 +29,12 @@ def otsu_threshold(arr: np.ndarray) -> float:
 
     for t in range(256):
         wB += hist[t]
+
         if wB == 0:
             continue
 
         wF = total - wB
+
         if wF == 0:
             break
 
@@ -97,14 +95,15 @@ def auto_find_paper_by_blue_edge(
     yy, xx = np.ogrid[:h, :w]
     circle_mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= r ** 2
 
-    return circle_mask, blue_edge_mask, blue_index, cx, cy, r
+    return circle_mask, blue_edge_mask, cx, cy, r
 
 
-# ---------- 分析藍色 / 褪色面積 ----------
-def analyze_blue_faded_area(
+# ---------- 分析白色褪色區 / 剩餘藍色區 ----------
+def analyze_faded_white_area(
     img_rgb: Image.Image,
     circle_mask: np.ndarray,
-    manual_threshold=None
+    manual_threshold=None,
+    white_bias=0.0
 ):
     arr = np.array(img_rgb).astype(np.float32)
 
@@ -112,35 +111,46 @@ def analyze_blue_faded_area(
     G = arr[:, :, 1]
     B = arr[:, :, 2]
 
+    # 亮度
+    gray = 0.299 * R + 0.587 * G + 0.114 * B
+
+    # 藍色指數
     blue_index = B - ((R + G) / 2)
 
-    valid_blue_index = blue_index[circle_mask]
+    # 白色分數：
+    # 白色區：亮度高、藍色指數低
+    # 藍色區：亮度低、藍色指數高
+    white_score = gray - blue_index + white_bias
+
+    valid_white_score = white_score[circle_mask]
 
     if manual_threshold is None:
-        threshold = otsu_threshold(valid_blue_index)
+        threshold = otsu_threshold(valid_white_score)
     else:
         threshold = manual_threshold
 
-    blue_mask = (blue_index > threshold) & circle_mask
-    faded_mask = (blue_index <= threshold) & circle_mask
+    faded_mask = (white_score > threshold) & circle_mask
+    blue_mask = (~faded_mask) & circle_mask
 
-    blue_count = int(blue_mask.sum())
     faded_count = int(faded_mask.sum())
-    total = blue_count + faded_count
+    blue_count = int(blue_mask.sum())
+    total = faded_count + blue_count
 
-    blue_ratio = blue_count / total if total else 0
     faded_ratio = faded_count / total if total else 0
+    blue_ratio = blue_count / total if total else 0
 
     return {
+        "gray": gray,
         "blue_index": blue_index,
+        "white_score": white_score,
         "threshold": threshold,
-        "blue_mask": blue_mask,
         "faded_mask": faded_mask,
-        "blue_count": blue_count,
+        "blue_mask": blue_mask,
         "faded_count": faded_count,
+        "blue_count": blue_count,
         "total": total,
-        "blue_ratio": blue_ratio,
         "faded_ratio": faded_ratio,
+        "blue_ratio": blue_ratio,
     }
 
 
@@ -149,25 +159,26 @@ def make_overlay(img_rgb, circle_mask, blue_edge_mask, blue_mask, faded_mask):
     arr = np.array(img_rgb).astype(np.float32)
     overlay = arr.copy()
 
-    alpha = 0.42
+    alpha_blue = 0.40
+    alpha_faded = 0.42
 
     # 圓形外部：變暗，表示桌面不計算
     outside = ~circle_mask
     overlay[outside] = overlay[outside] * 0.30
 
-    # 藍色區：黃色標示
+    # 剩餘藍色區：黃色標示
     overlay[blue_mask] = (
-        (1 - alpha) * overlay[blue_mask]
-        + alpha * np.array([255, 220, 0])
+        (1 - alpha_blue) * overlay[blue_mask]
+        + alpha_blue * np.array([255, 230, 0])
     )
 
-    # 褪色區：紅色標示
+    # 白色褪色區：紅色標示
     overlay[faded_mask] = (
-        (1 - alpha) * overlay[faded_mask]
-        + alpha * np.array([255, 0, 0])
+        (1 - alpha_faded) * overlay[faded_mask]
+        + alpha_faded * np.array([255, 0, 0])
     )
 
-    # 自動偵測到的深藍外圈：加深黃色
+    # 自動偵測到的深藍外圈：亮黃色加強
     edge_show = blue_edge_mask & circle_mask
     overlay[edge_show] = (
         0.35 * overlay[edge_show]
@@ -178,11 +189,11 @@ def make_overlay(img_rgb, circle_mask, blue_edge_mask, blue_mask, faded_mask):
 
 
 # ================= Streamlit UI =================
-st.title("🧪 圓形鉬藍試紙褪色面積分析")
+st.title("🧪 圓形鉬藍試紙白色褪色面積分析")
 
 st.write(
     "本程式會自動偵測圓形試紙，排除桌面背景，"
-    "並使用 Blue Index = B - (R+G)/2 判斷藍色與褪色區。"
+    "並以「白色分數」判斷褪色區，避免把陰影中的藍色誤判成褪色。"
 )
 
 uploaded_file = st.file_uploader(
@@ -214,7 +225,7 @@ if uploaded_file:
             0.90, 1.15, 1.03, 0.01
         )
 
-    circle_mask, blue_edge_mask, blue_index, cx, cy, r = auto_find_paper_by_blue_edge(
+    circle_mask, blue_edge_mask, cx, cy, r = auto_find_paper_by_blue_edge(
         img,
         blue_b_min=blue_b_min,
         blue_index_min=blue_index_min,
@@ -223,37 +234,50 @@ if uploaded_file:
 
     st.info(f"自動偵測結果：圓心 = ({cx}, {cy})，半徑 = {r} px")
 
-    st.subheader("3) 藍色 / 褪色判斷")
+    st.subheader("3) 白色褪色區判斷")
 
-    auto_result = analyze_blue_faded_area(
+    auto_result = analyze_faded_white_area(
         img,
         circle_mask,
-        manual_threshold=None
+        manual_threshold=None,
+        white_bias=0.0
     )
 
-    with st.expander("進階設定：手動調整 Blue Index 閾值", expanded=False):
+    with st.expander("進階設定：手動調整白色判斷閾值", expanded=False):
         use_manual = st.checkbox("使用手動閾值", value=False)
 
         manual_threshold = st.slider(
-            "Blue Index 閾值",
-            -100.0,
-            200.0,
+            "White Score 閾值",
+            0.0,
+            255.0,
             float(auto_result["threshold"]),
             1.0
         )
 
+        white_bias = st.slider(
+            "白色判斷偏移值",
+            -100.0,
+            100.0,
+            0.0,
+            1.0
+        )
+
     if use_manual:
-        result = analyze_blue_faded_area(
+        result = analyze_faded_white_area(
             img,
             circle_mask,
-            manual_threshold=manual_threshold
+            manual_threshold=manual_threshold,
+            white_bias=white_bias
         )
     else:
-        result = auto_result
+        result = analyze_faded_white_area(
+            img,
+            circle_mask,
+            manual_threshold=None,
+            white_bias=white_bias
+        )
 
-    st.write(
-        f"目前 Blue Index 閾值：**{result['threshold']:.2f}**"
-    )
+    st.write(f"目前 White Score 閾值：**{result['threshold']:.2f}**")
 
     overlay = make_overlay(
         img,
@@ -267,22 +291,22 @@ if uploaded_file:
 
     st.image(
         Image.fromarray(overlay),
-        caption="黃色=藍色區，紅色=褪色區，變暗區=桌面不計算",
+        caption="黃色=剩餘藍色區，紅色=白色褪色區，變暗區=桌面不計算",
         use_container_width=True
     )
 
     st.success(
-        f"✅ 藍色剩餘面積比例：**{result['blue_ratio']:.2%}**　｜　"
-        f"褪色面積比例：**{result['faded_ratio']:.2%}**"
+        f"✅ 剩餘藍色面積比例：**{result['blue_ratio']:.2%}**　｜　"
+        f"白色褪色面積比例：**{result['faded_ratio']:.2%}**"
     )
 
     st.subheader("5) 數值摘要")
 
     st.write(
         f"- Blue pixels：{result['blue_count']}\n"
-        f"- Faded pixels：{result['faded_count']}\n"
+        f"- Faded white pixels：{result['faded_count']}\n"
         f"- Total counted pixels：{result['total']}\n"
         f"- Blue ratio：{result['blue_ratio']:.4f}\n"
-        f"- Faded ratio：{result['faded_ratio']:.4f}\n"
-        f"- Blue Index threshold：{result['threshold']:.2f}"
+        f"- Faded white ratio：{result['faded_ratio']:.4f}\n"
+        f"- White Score threshold：{result['threshold']:.2f}"
     )
