@@ -100,19 +100,18 @@ def auto_find_paper_by_blue_edge(
 
 
 # ---------- 保留中心連通的白色褪色區 ----------
-def keep_center_connected_region(candidate_mask, cx, cy, search_radius=60):
+def keep_center_connected_region(candidate_mask, cx, cy, search_radius=80):
     """
     從中心附近尋找 candidate_mask=True 的起點，
-    然後只保留與該起點連通的區域。
-    這可以避免外圈邊緣或雜訊被判斷成褪色區。
+    只保留與中心相連的白色褪色區。
     """
     h, w = candidate_mask.shape
 
     cx = int(np.clip(cx, 0, w - 1))
     cy = int(np.clip(cy, 0, h - 1))
 
-    # 先找中心附近是否有白色候選點
     yy, xx = np.ogrid[:h, :w]
+
     center_search_mask = (
         ((xx - cx) ** 2 + (yy - cy) ** 2 <= search_radius ** 2)
         & candidate_mask
@@ -121,12 +120,11 @@ def keep_center_connected_region(candidate_mask, cx, cy, search_radius=60):
     ys, xs = np.where(center_search_mask)
 
     if len(xs) == 0:
-        # 如果中心附近沒有找到，就回傳空遮罩
         return np.zeros_like(candidate_mask, dtype=bool)
 
-    # 選擇距離中心最近的候選點作為起點
     distances = (xs - cx) ** 2 + (ys - cy) ** 2
     idx = int(np.argmin(distances))
+
     start_x = int(xs[idx])
     start_y = int(ys[idx])
 
@@ -135,10 +133,10 @@ def keep_center_connected_region(candidate_mask, cx, cy, search_radius=60):
 
     q = deque()
     q.append((start_y, start_x))
+
     visited[start_y, start_x] = True
     connected[start_y, start_x] = True
 
-    # 8-connected flood fill
     directions = [
         (-1, -1), (-1, 0), (-1, 1),
         (0, -1),           (0, 1),
@@ -167,6 +165,68 @@ def keep_center_connected_region(candidate_mask, cx, cy, search_radius=60):
     return connected
 
 
+# ---------- 填補紅色褪色區內部破洞 ----------
+def fill_holes(mask: np.ndarray):
+    """
+    填補 mask 內部孔洞。
+    可避免紅色褪色區內部出現黃色破洞。
+    """
+    h, w = mask.shape
+
+    background = ~mask
+    visited = np.zeros_like(mask, dtype=bool)
+
+    q = deque()
+
+    # 從影像邊界出發，找真正外部背景
+    for x in range(w):
+        if background[0, x]:
+            q.append((0, x))
+            visited[0, x] = True
+
+        if background[h - 1, x]:
+            q.append((h - 1, x))
+            visited[h - 1, x] = True
+
+    for y in range(h):
+        if background[y, 0]:
+            q.append((y, 0))
+            visited[y, 0] = True
+
+        if background[y, w - 1]:
+            q.append((y, w - 1))
+            visited[y, w - 1] = True
+
+    directions = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1)
+    ]
+
+    while q:
+        y, x = q.popleft()
+
+        for dy, dx in directions:
+            ny = y + dy
+            nx = x + dx
+
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                continue
+
+            if visited[ny, nx]:
+                continue
+
+            if background[ny, nx]:
+                visited[ny, nx] = True
+                q.append((ny, nx))
+
+    holes = background & (~visited)
+    filled = mask | holes
+
+    return filled
+
+
 # ---------- 分析白色褪色區 / 剩餘藍色區 ----------
 def analyze_faded_white_area(
     img_rgb: Image.Image,
@@ -176,7 +236,8 @@ def analyze_faded_white_area(
     manual_threshold=None,
     white_bias=0.0,
     center_search_radius=80,
-    min_candidate_ratio=0.02
+    min_candidate_ratio=0.02,
+    hole_fill=True
 ):
     arr = np.array(img_rgb).astype(np.float32)
 
@@ -202,16 +263,15 @@ def analyze_faded_white_area(
     else:
         threshold = manual_threshold
 
-    # 所有可能的白色區
+    # 初步候選白色褪色區
     candidate_faded = (white_score > threshold) & circle_mask
 
-    # 若候選白色區太少，避免誤判
     candidate_ratio = candidate_faded.sum() / circle_mask.sum()
 
     if candidate_ratio < min_candidate_ratio:
         faded_mask = np.zeros_like(circle_mask, dtype=bool)
     else:
-        # 只保留「與中心相連」的那一片白色區
+        # 只保留與中心相連的褪色區
         faded_mask = keep_center_connected_region(
             candidate_faded,
             cx=cx,
@@ -219,7 +279,12 @@ def analyze_faded_white_area(
             search_radius=center_search_radius
         )
 
-    # 剩餘區域都視為藍色區
+        # 填補紅色褪色區內部破洞
+        if hole_fill:
+            faded_mask = fill_holes(faded_mask)
+            faded_mask = faded_mask & circle_mask
+
+    # 圓形試紙內，扣除褪色區後都視為剩餘藍色區
     blue_mask = circle_mask & (~faded_mask)
 
     faded_count = int(faded_mask.sum())
@@ -305,8 +370,8 @@ st.write(
 )
 
 st.info(
-    "判斷原則：試劑從中心滴入，因此褪色區應該是從中心向外擴散的連通區。"
-    "外圈邊緣若被白色分數誤判，因為沒有和中心相連，會被排除。"
+    "判斷原則：試劑從中心滴入，因此褪色區應該是從中心向外擴散的連通區；"
+    "紅色區內部破洞會自動填補。"
 )
 
 uploaded_file = st.file_uploader(
@@ -376,6 +441,11 @@ if uploaded_file:
             help="候選白色區太少時視為無明顯褪色，避免雜訊。"
         )
 
+        hole_fill = st.checkbox(
+            "填補紅色褪色區內部破洞",
+            value=True
+        )
+
         show_candidate = st.checkbox(
             "顯示所有候選褪色區",
             value=False,
@@ -390,7 +460,8 @@ if uploaded_file:
         manual_threshold=None,
         white_bias=white_bias,
         center_search_radius=center_search_radius,
-        min_candidate_ratio=min_candidate_ratio
+        min_candidate_ratio=min_candidate_ratio,
+        hole_fill=hole_fill
     )
 
     with st.expander("進階設定：手動調整 White Score 閾值", expanded=False):
@@ -413,7 +484,8 @@ if uploaded_file:
             manual_threshold=manual_threshold,
             white_bias=white_bias,
             center_search_radius=center_search_radius,
-            min_candidate_ratio=min_candidate_ratio
+            min_candidate_ratio=min_candidate_ratio,
+            hole_fill=hole_fill
         )
     else:
         result = auto_result
