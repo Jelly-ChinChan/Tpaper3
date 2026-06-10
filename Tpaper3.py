@@ -4,16 +4,12 @@ import numpy as np
 from collections import deque
 
 
-# ---------- Otsu 閾值 ----------
 def otsu_threshold(arr: np.ndarray) -> float:
     values = arr.ravel().astype(np.float64)
-
     if values.size == 0:
         return 0.0
 
-    v_min = values.min()
-    v_max = values.max()
-
+    v_min, v_max = values.min(), values.max()
     if v_max == v_min:
         return float(v_min)
 
@@ -21,8 +17,8 @@ def otsu_threshold(arr: np.ndarray) -> float:
 
     hist = np.bincount(scaled, minlength=256).astype(np.float64)
     total = scaled.size
-
     sum_total = np.dot(np.arange(256), hist)
+
     sumB = 0.0
     wB = 0.0
     maximum = -1.0
@@ -30,12 +26,10 @@ def otsu_threshold(arr: np.ndarray) -> float:
 
     for t in range(256):
         wB += hist[t]
-
         if wB == 0:
             continue
 
         wF = total - wB
-
         if wF == 0:
             break
 
@@ -44,17 +38,13 @@ def otsu_threshold(arr: np.ndarray) -> float:
         mF = (sum_total - sumB) / wF
 
         between = wB * wF * (mB - mF) ** 2
-
         if between > maximum:
             maximum = between
             threshold_scaled = t
 
-    threshold_original = v_min + (threshold_scaled / 255) * (v_max - v_min)
-
-    return float(threshold_original)
+    return float(v_min + (threshold_scaled / 255) * (v_max - v_min))
 
 
-# ---------- 自動偵測深藍色試紙外圈 ----------
 def auto_find_paper_by_blue_edge(
     img_rgb: Image.Image,
     blue_b_min=70,
@@ -78,8 +68,7 @@ def auto_find_paper_by_blue_edge(
     ys, xs = np.where(blue_edge_mask)
 
     if len(xs) < 100:
-        cx = w // 2
-        cy = h // 2
+        cx, cy = w // 2, h // 2
         r = min(w, h) // 2
     else:
         x0, x1 = xs.min(), xs.max()
@@ -99,43 +88,9 @@ def auto_find_paper_by_blue_edge(
     return circle_mask, blue_edge_mask, cx, cy, r
 
 
-# ---------- 保留中心連通的白色褪色區 ----------
-def keep_center_connected_region(candidate_mask, cx, cy, search_radius=80):
-    """
-    從中心附近尋找 candidate_mask=True 的起點，
-    只保留與中心相連的白色褪色區。
-    """
+def largest_candidate_component(candidate_mask, cx, cy):
     h, w = candidate_mask.shape
-
-    cx = int(np.clip(cx, 0, w - 1))
-    cy = int(np.clip(cy, 0, h - 1))
-
-    yy, xx = np.ogrid[:h, :w]
-
-    center_search_mask = (
-        ((xx - cx) ** 2 + (yy - cy) ** 2 <= search_radius ** 2)
-        & candidate_mask
-    )
-
-    ys, xs = np.where(center_search_mask)
-
-    if len(xs) == 0:
-        return np.zeros_like(candidate_mask, dtype=bool)
-
-    distances = (xs - cx) ** 2 + (ys - cy) ** 2
-    idx = int(np.argmin(distances))
-
-    start_x = int(xs[idx])
-    start_y = int(ys[idx])
-
     visited = np.zeros_like(candidate_mask, dtype=bool)
-    connected = np.zeros_like(candidate_mask, dtype=bool)
-
-    q = deque()
-    q.append((start_y, start_x))
-
-    visited[start_y, start_x] = True
-    connected[start_y, start_x] = True
 
     directions = [
         (-1, -1), (-1, 0), (-1, 1),
@@ -143,91 +98,132 @@ def keep_center_connected_region(candidate_mask, cx, cy, search_radius=80):
         (1, -1),  (1, 0),  (1, 1)
     ]
 
-    while q:
-        y, x = q.popleft()
+    best_component = np.zeros_like(candidate_mask, dtype=bool)
+    best_score = -1
 
-        for dy, dx in directions:
-            ny = y + dy
-            nx = x + dx
+    ys_all, xs_all = np.where(candidate_mask)
 
-            if ny < 0 or ny >= h or nx < 0 or nx >= w:
-                continue
+    for sy, sx in zip(ys_all, xs_all):
+        if visited[sy, sx]:
+            continue
 
-            if visited[ny, nx]:
-                continue
+        q = deque()
+        q.append((sy, sx))
+        visited[sy, sx] = True
 
-            visited[ny, nx] = True
+        pixels = []
 
-            if candidate_mask[ny, nx]:
-                connected[ny, nx] = True
-                q.append((ny, nx))
+        while q:
+            y, x = q.popleft()
+            pixels.append((y, x))
 
-    return connected
+            for dy, dx in directions:
+                ny, nx = y + dy, x + dx
+
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+
+                if visited[ny, nx]:
+                    continue
+
+                if candidate_mask[ny, nx]:
+                    visited[ny, nx] = True
+                    q.append((ny, nx))
+
+        if len(pixels) == 0:
+            continue
+
+        py = np.array([p[0] for p in pixels])
+        px = np.array([p[1] for p in pixels])
+
+        dist_to_center = np.sqrt((px.mean() - cx) ** 2 + (py.mean() - cy) ** 2)
+
+        # 面積越大越好，離中心越近越好
+        score = len(pixels) - dist_to_center * 2
+
+        if score > best_score:
+            best_score = score
+            best_component = np.zeros_like(candidate_mask, dtype=bool)
+            best_component[py, px] = True
+
+    return best_component
 
 
-# ---------- 填補紅色褪色區內部破洞 ----------
-def fill_holes(mask: np.ndarray):
+def radial_fill_from_boundary(boundary_mask, circle_mask, cx, cy, bins=720):
     """
-    填補 mask 內部孔洞。
-    可避免紅色褪色區內部出現黃色破洞。
+    將中心到紅色邊界之間全部填滿。
+    可避免紅色內部出現黃色破洞。
     """
-    h, w = mask.shape
+    h, w = boundary_mask.shape
 
-    background = ~mask
-    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.where(boundary_mask)
 
-    q = deque()
+    if len(xs) == 0:
+        return np.zeros_like(boundary_mask, dtype=bool)
 
-    # 從影像邊界出發，找真正外部背景
-    for x in range(w):
-        if background[0, x]:
-            q.append((0, x))
-            visited[0, x] = True
+    dx = xs - cx
+    dy = ys - cy
 
-        if background[h - 1, x]:
-            q.append((h - 1, x))
-            visited[h - 1, x] = True
+    angles = np.arctan2(dy, dx)
+    angles = (angles + 2 * np.pi) % (2 * np.pi)
 
-    for y in range(h):
-        if background[y, 0]:
-            q.append((y, 0))
-            visited[y, 0] = True
+    radii = np.sqrt(dx ** 2 + dy ** 2)
 
-        if background[y, w - 1]:
-            q.append((y, w - 1))
-            visited[y, w - 1] = True
+    angle_bins = np.floor(angles / (2 * np.pi) * bins).astype(int)
+    angle_bins = np.clip(angle_bins, 0, bins - 1)
 
-    directions = [
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1)
-    ]
+    max_r = np.zeros(bins, dtype=np.float32)
 
-    while q:
-        y, x = q.popleft()
+    for b, r in zip(angle_bins, radii):
+        if r > max_r[b]:
+            max_r[b] = r
 
-        for dy, dx in directions:
-            ny = y + dy
-            nx = x + dx
+    # 補沒有資料的角度
+    valid = max_r > 0
+    if valid.sum() < 10:
+        return boundary_mask
 
-            if ny < 0 or ny >= h or nx < 0 or nx >= w:
-                continue
+    for i in range(bins):
+        if max_r[i] == 0:
+            left = i
+            right = i
 
-            if visited[ny, nx]:
-                continue
+            while max_r[left % bins] == 0:
+                left -= 1
 
-            if background[ny, nx]:
-                visited[ny, nx] = True
-                q.append((ny, nx))
+            while max_r[right % bins] == 0:
+                right += 1
 
-    holes = background & (~visited)
-    filled = mask | holes
+            max_r[i] = (max_r[left % bins] + max_r[right % bins]) / 2
+
+    # 平滑邊界，避免鋸齒過強
+    smooth = max_r.copy()
+    window = 9
+
+    for i in range(bins):
+        vals = []
+        for k in range(-window, window + 1):
+            vals.append(max_r[(i + k) % bins])
+        smooth[i] = np.mean(vals)
+
+    yy, xx = np.ogrid[:h, :w]
+
+    dx_all = xx - cx
+    dy_all = yy - cy
+
+    angle_all = np.arctan2(dy_all, dx_all)
+    angle_all = (angle_all + 2 * np.pi) % (2 * np.pi)
+
+    bin_all = np.floor(angle_all / (2 * np.pi) * bins).astype(int)
+    bin_all = np.clip(bin_all, 0, bins - 1)
+
+    radius_all = np.sqrt(dx_all ** 2 + dy_all ** 2)
+
+    filled = (radius_all <= smooth[bin_all]) & circle_mask
 
     return filled
 
 
-# ---------- 分析白色褪色區 / 剩餘藍色區 ----------
 def analyze_faded_white_area(
     img_rgb: Image.Image,
     circle_mask: np.ndarray,
@@ -235,9 +231,8 @@ def analyze_faded_white_area(
     cy: int,
     manual_threshold=None,
     white_bias=0.0,
-    center_search_radius=80,
     min_candidate_ratio=0.02,
-    hole_fill=True
+    radial_fill=True
 ):
     arr = np.array(img_rgb).astype(np.float32)
 
@@ -245,15 +240,9 @@ def analyze_faded_white_area(
     G = arr[:, :, 1]
     B = arr[:, :, 2]
 
-    # 亮度
     gray = 0.299 * R + 0.587 * G + 0.114 * B
-
-    # 藍色指數
     blue_index = B - ((R + G) / 2)
 
-    # 白色分數：
-    # 白色區：亮度高、藍色指數低
-    # 藍色區：亮度低、藍色指數高
     white_score = gray - blue_index + white_bias
 
     valid_white_score = white_score[circle_mask]
@@ -263,28 +252,30 @@ def analyze_faded_white_area(
     else:
         threshold = manual_threshold
 
-    # 初步候選白色褪色區
     candidate_faded = (white_score > threshold) & circle_mask
-
     candidate_ratio = candidate_faded.sum() / circle_mask.sum()
 
     if candidate_ratio < min_candidate_ratio:
         faded_mask = np.zeros_like(circle_mask, dtype=bool)
     else:
-        # 只保留與中心相連的褪色區
-        faded_mask = keep_center_connected_region(
+        boundary_component = largest_candidate_component(
             candidate_faded,
             cx=cx,
-            cy=cy,
-            search_radius=center_search_radius
+            cy=cy
         )
 
-        # 填補紅色褪色區內部破洞
-        if hole_fill:
-            faded_mask = fill_holes(faded_mask)
-            faded_mask = faded_mask & circle_mask
+        if radial_fill:
+            faded_mask = radial_fill_from_boundary(
+                boundary_component,
+                circle_mask,
+                cx=cx,
+                cy=cy
+            )
+        else:
+            faded_mask = boundary_component
 
-    # 圓形試紙內，扣除褪色區後都視為剩餘藍色區
+        faded_mask = faded_mask & circle_mask
+
     blue_mask = circle_mask & (~faded_mask)
 
     faded_count = int(faded_mask.sum())
@@ -311,7 +302,6 @@ def analyze_faded_white_area(
     }
 
 
-# ---------- 製作分析疊圖 ----------
 def make_overlay(
     img_rgb,
     circle_mask,
@@ -328,30 +318,25 @@ def make_overlay(
     alpha_faded = 0.45
     alpha_candidate = 0.25
 
-    # 圓形外部：變暗，表示桌面不計算
     outside = ~circle_mask
     overlay[outside] = overlay[outside] * 0.30
 
-    # 若要看候選褪色區，先用紫色淡淡標示
     if show_candidate and candidate_faded is not None:
         overlay[candidate_faded] = (
             (1 - alpha_candidate) * overlay[candidate_faded]
             + alpha_candidate * np.array([180, 0, 255])
         )
 
-    # 剩餘藍色區：黃色標示
     overlay[blue_mask] = (
         (1 - alpha_blue) * overlay[blue_mask]
         + alpha_blue * np.array([255, 230, 0])
     )
 
-    # 中心連通白色褪色區：紅色標示
     overlay[faded_mask] = (
         (1 - alpha_faded) * overlay[faded_mask]
         + alpha_faded * np.array([255, 0, 0])
     )
 
-    # 自動偵測到的深藍外圈：亮黃色加強
     edge_show = blue_edge_mask & circle_mask
     overlay[edge_show] = (
         0.35 * overlay[edge_show]
@@ -366,12 +351,7 @@ st.title("🧪 圓形鉬藍試紙白色褪色面積分析")
 
 st.write(
     "本程式會自動偵測圓形試紙，排除桌面背景，"
-    "並只保留與中心相連的不規則白色褪色區。"
-)
-
-st.info(
-    "判斷原則：試劑從中心滴入，因此褪色區應該是從中心向外擴散的連通區；"
-    "紅色區內部破洞會自動填補。"
+    "並將中心到褪色邊界之間填滿，避免紅色區內部出現黃色破洞。"
 )
 
 uploaded_file = st.file_uploader(
@@ -388,19 +368,21 @@ if uploaded_file:
     st.subheader("2) 自動偵測圓形試紙")
 
     with st.expander("進階設定：圓形試紙偵測", expanded=False):
-        blue_b_min = st.slider(
-            "偵測外圈：B 通道最低值",
-            0, 255, 70
-        )
+        blue_b_min = st.slider("偵測外圈：B 通道最低值", 0, 255, 70)
 
         blue_index_min = st.slider(
             "偵測外圈：Blue Index 最低值",
-            -50, 150, 15
+            -50,
+            150,
+            15
         )
 
         expand_ratio = st.slider(
             "圓形遮罩放大比例",
-            0.90, 1.15, 1.03, 0.01
+            0.90,
+            1.15,
+            1.03,
+            0.01
         )
 
     circle_mask, blue_edge_mask, cx, cy, r = auto_find_paper_by_blue_edge(
@@ -412,18 +394,9 @@ if uploaded_file:
 
     st.info(f"自動偵測結果：圓心 = ({cx}, {cy})，半徑 = {r} px")
 
-    st.subheader("3) 中心連通褪色區判斷")
+    st.subheader("3) 褪色區判斷")
 
-    with st.expander("進階設定：中心連通區判斷", expanded=False):
-        center_search_radius = st.slider(
-            "中心搜尋半徑",
-            10,
-            200,
-            80,
-            5,
-            help="程式會在圓心附近尋找白色褪色區起點。若中心白色區沒有被抓到，可以調大。"
-        )
-
+    with st.expander("進階設定：褪色區分析", expanded=False):
         white_bias = st.slider(
             "白色判斷偏移值",
             -100.0,
@@ -437,19 +410,17 @@ if uploaded_file:
             0.0,
             0.10,
             0.02,
-            0.005,
-            help="候選白色區太少時視為無明顯褪色，避免雜訊。"
+            0.005
         )
 
-        hole_fill = st.checkbox(
-            "填補紅色褪色區內部破洞",
+        radial_fill = st.checkbox(
+            "從中心填滿到褪色邊界",
             value=True
         )
 
         show_candidate = st.checkbox(
-            "顯示所有候選褪色區",
-            value=False,
-            help="紫色會顯示原本可能被判定為褪色的區域；最後紅色只保留與中心相連的區域。"
+            "顯示候選褪色區",
+            value=False
         )
 
     auto_result = analyze_faded_white_area(
@@ -459,9 +430,8 @@ if uploaded_file:
         cy=cy,
         manual_threshold=None,
         white_bias=white_bias,
-        center_search_radius=center_search_radius,
         min_candidate_ratio=min_candidate_ratio,
-        hole_fill=hole_fill
+        radial_fill=radial_fill
     )
 
     with st.expander("進階設定：手動調整 White Score 閾值", expanded=False):
@@ -483,9 +453,8 @@ if uploaded_file:
             cy=cy,
             manual_threshold=manual_threshold,
             white_bias=white_bias,
-            center_search_radius=center_search_radius,
             min_candidate_ratio=min_candidate_ratio,
-            hole_fill=hole_fill
+            radial_fill=radial_fill
         )
     else:
         result = auto_result
@@ -507,23 +476,23 @@ if uploaded_file:
 
     st.image(
         Image.fromarray(overlay),
-        caption="黃色=剩餘藍色區，紅色=中心連通白色褪色區，紫色=候選褪色區，變暗區=桌面不計算",
+        caption="黃色=剩餘藍色區，紅色=中心到褪色邊界的白色褪色區，紫色=候選褪色區，變暗區=桌面不計算",
         use_container_width=True
     )
 
     st.success(
         f"✅ 剩餘藍色面積比例：**{result['blue_ratio']:.2%}**　｜　"
-        f"中心白色褪色面積比例：**{result['faded_ratio']:.2%}**"
+        f"白色褪色面積比例：**{result['faded_ratio']:.2%}**"
     )
 
     st.subheader("5) 數值摘要")
 
     st.write(
         f"- Blue pixels：{result['blue_count']}\n"
-        f"- Center connected faded white pixels：{result['faded_count']}\n"
+        f"- Faded white pixels：{result['faded_count']}\n"
         f"- Total counted pixels：{result['total']}\n"
         f"- Blue ratio：{result['blue_ratio']:.4f}\n"
-        f"- Center connected faded white ratio：{result['faded_ratio']:.4f}\n"
+        f"- Faded white ratio：{result['faded_ratio']:.4f}\n"
         f"- White Score threshold：{result['threshold']:.2f}\n"
         f"- Candidate faded ratio：{result['candidate_ratio']:.4f}"
     )
