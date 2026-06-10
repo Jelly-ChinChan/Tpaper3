@@ -1,6 +1,7 @@
 import streamlit as st
 from PIL import Image
 import numpy as np
+from collections import deque
 
 
 # ---------- Otsu 閾值 ----------
@@ -95,18 +96,161 @@ def auto_find_paper_by_blue_edge(
     r = min(r, cx, cy, w - cx - 1, h - cy - 1)
 
     yy, xx = np.ogrid[:h, :w]
-
     circle_mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= r ** 2
 
     return circle_mask, blue_edge_mask, cx, cy, r
 
 
-# ---------- 二區分析：剩餘藍色 / 白色褪色 ----------
-def analyze_two_zones(
+# ---------- 找出最大候選褪色邊界 ----------
+def largest_candidate_component(candidate_mask, cx, cy):
+    h, w = candidate_mask.shape
+    visited = np.zeros_like(candidate_mask, dtype=bool)
+
+    directions = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1)
+    ]
+
+    best_component = np.zeros_like(candidate_mask, dtype=bool)
+    best_score = -1
+
+    ys_all, xs_all = np.where(candidate_mask)
+
+    for sy, sx in zip(ys_all, xs_all):
+        if visited[sy, sx]:
+            continue
+
+        q = deque()
+        q.append((sy, sx))
+        visited[sy, sx] = True
+
+        pixels = []
+
+        while q:
+            y, x = q.popleft()
+            pixels.append((y, x))
+
+            for dy, dx in directions:
+                ny = y + dy
+                nx = x + dx
+
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+
+                if visited[ny, nx]:
+                    continue
+
+                if candidate_mask[ny, nx]:
+                    visited[ny, nx] = True
+                    q.append((ny, nx))
+
+        if len(pixels) == 0:
+            continue
+
+        py = np.array([p[0] for p in pixels])
+        px = np.array([p[1] for p in pixels])
+
+        dist_to_center = np.sqrt((px.mean() - cx) ** 2 + (py.mean() - cy) ** 2)
+
+        # 面積越大越好，離中心越近越好
+        score = len(pixels) - dist_to_center * 2
+
+        if score > best_score:
+            best_score = score
+            best_component = np.zeros_like(candidate_mask, dtype=bool)
+            best_component[py, px] = True
+
+    return best_component
+
+
+# ---------- 從中心填滿到褪色邊界 ----------
+def radial_fill_from_boundary(boundary_mask, circle_mask, cx, cy, bins=720):
+    """
+    將中心到褪色邊界之間全部填滿。
+    讓紅色外輪廓內部全部變成紅色。
+    """
+    h, w = boundary_mask.shape
+
+    ys, xs = np.where(boundary_mask)
+
+    if len(xs) == 0:
+        return np.zeros_like(boundary_mask, dtype=bool)
+
+    dx = xs - cx
+    dy = ys - cy
+
+    angles = np.arctan2(dy, dx)
+    angles = (angles + 2 * np.pi) % (2 * np.pi)
+
+    radii = np.sqrt(dx ** 2 + dy ** 2)
+
+    angle_bins = np.floor(angles / (2 * np.pi) * bins).astype(int)
+    angle_bins = np.clip(angle_bins, 0, bins - 1)
+
+    max_r = np.zeros(bins, dtype=np.float32)
+
+    for b, r in zip(angle_bins, radii):
+        if r > max_r[b]:
+            max_r[b] = r
+
+    valid = max_r > 0
+
+    if valid.sum() < 10:
+        return boundary_mask
+
+    # 補沒有資料的角度
+    for i in range(bins):
+        if max_r[i] == 0:
+            left = i
+            right = i
+
+            while max_r[left % bins] == 0:
+                left -= 1
+
+            while max_r[right % bins] == 0:
+                right += 1
+
+            max_r[i] = (max_r[left % bins] + max_r[right % bins]) / 2
+
+    # 平滑輪廓，避免鋸齒
+    smooth = max_r.copy()
+    window = 7
+
+    for i in range(bins):
+        vals = []
+        for k in range(-window, window + 1):
+            vals.append(max_r[(i + k) % bins])
+        smooth[i] = np.mean(vals)
+
+    yy, xx = np.ogrid[:h, :w]
+
+    dx_all = xx - cx
+    dy_all = yy - cy
+
+    angle_all = np.arctan2(dy_all, dx_all)
+    angle_all = (angle_all + 2 * np.pi) % (2 * np.pi)
+
+    bin_all = np.floor(angle_all / (2 * np.pi) * bins).astype(int)
+    bin_all = np.clip(bin_all, 0, bins - 1)
+
+    radius_all = np.sqrt(dx_all ** 2 + dy_all ** 2)
+
+    filled = (radius_all <= smooth[bin_all]) & circle_mask
+
+    return filled
+
+
+# ---------- 二區分析：紅色內部填滿 ----------
+def analyze_two_zones_filled(
     img_rgb: Image.Image,
     circle_mask: np.ndarray,
+    cx: int,
+    cy: int,
     white_threshold=None,
-    white_bias=0.0
+    white_bias=0.0,
+    min_candidate_ratio=0.02,
+    radial_fill=True
 ):
     arr = np.array(img_rgb).astype(np.float32)
 
@@ -117,10 +261,10 @@ def analyze_two_zones(
     # 亮度
     gray = 0.299 * R + 0.587 * G + 0.114 * B
 
-    # 藍色指數：越大越藍
+    # 藍色指數
     blue_index = B - ((R + G) / 2)
 
-    # 白色分數：越大越白，越接近褪色
+    # 白色分數：越大越白，越可能是褪色區
     white_score = gray - blue_index + white_bias
 
     valid_white_score = white_score[circle_mask]
@@ -128,10 +272,35 @@ def analyze_two_zones(
     if white_threshold is None:
         white_threshold = otsu_threshold(valid_white_score)
 
-    # 紅色：白色褪色區
-    faded_mask = (white_score > white_threshold) & circle_mask
+    # 初步候選褪色邊界
+    candidate_faded = (white_score > white_threshold) & circle_mask
 
-    # 黃色：剩餘藍色區
+    candidate_ratio = candidate_faded.sum() / circle_mask.sum()
+
+    if candidate_ratio < min_candidate_ratio:
+        faded_mask = np.zeros_like(circle_mask, dtype=bool)
+    else:
+        # 找主要褪色邊界
+        boundary_component = largest_candidate_component(
+            candidate_faded,
+            cx=cx,
+            cy=cy
+        )
+
+        if radial_fill:
+            # 從中心填滿到褪色邊界
+            faded_mask = radial_fill_from_boundary(
+                boundary_component,
+                circle_mask,
+                cx=cx,
+                cy=cy
+            )
+        else:
+            faded_mask = boundary_component
+
+        faded_mask = faded_mask & circle_mask
+
+    # 圓形試紙扣除褪色區，其餘全部視為剩餘藍色區
     blue_mask = circle_mask & (~faded_mask)
 
     faded_count = int(faded_mask.sum())
@@ -146,6 +315,8 @@ def analyze_two_zones(
         "blue_index": blue_index,
         "white_score": white_score,
         "white_threshold": white_threshold,
+        "candidate_faded": candidate_faded,
+        "candidate_ratio": candidate_ratio,
         "faded_mask": faded_mask,
         "blue_mask": blue_mask,
         "faded_count": faded_count,
@@ -162,7 +333,9 @@ def make_overlay(
     circle_mask,
     blue_edge_mask,
     blue_mask,
-    faded_mask
+    faded_mask,
+    show_candidate=False,
+    candidate_faded=None
 ):
     arr = np.array(img_rgb).astype(np.float32)
     overlay = arr.copy()
@@ -171,9 +344,13 @@ def make_overlay(
     outside = ~circle_mask
     overlay[outside] = overlay[outside] * 0.30
 
-    # 直接覆蓋，避免混色
-    overlay[blue_mask] = np.array([255, 230, 0])   # 黃色：剩餘藍色區
-    overlay[faded_mask] = np.array([255, 0, 0])    # 紅色：白色褪色區
+    # 顯示候選褪色邊界，可用來確認程式抓到哪裡
+    if show_candidate and candidate_faded is not None:
+        overlay[candidate_faded] = np.array([180, 0, 255])  # 紫色
+
+    # 二區直接覆蓋，不透明、不混色
+    overlay[blue_mask] = np.array([255, 230, 0])  # 黃色：剩餘藍色區
+    overlay[faded_mask] = np.array([255, 0, 0])   # 紅色：褪色區
 
     # 深藍外圈偵測結果：亮黃強調
     edge_show = blue_edge_mask & circle_mask
@@ -187,7 +364,7 @@ st.title("🧪 圓形鉬藍試紙二區面積分析")
 
 st.write(
     "本程式會自動偵測圓形試紙，排除桌面背景，"
-    "並將試紙分成二區：剩餘藍色區與白色褪色區。"
+    "並將紅色褪色外輪廓內部全部填滿。"
 )
 
 st.info(
@@ -241,13 +418,15 @@ if uploaded_file:
 
     st.subheader("3) 二區判斷參數")
 
-    auto_result = analyze_two_zones(
+    auto_result = analyze_two_zones_filled(
         img,
         circle_mask,
+        cx=cx,
+        cy=cy,
         white_threshold=None
     )
 
-    with st.expander("進階設定：手動調整褪色判斷", expanded=False):
+    with st.expander("進階設定：褪色區判斷", expanded=False):
         use_manual = st.checkbox("使用手動閾值", value=False)
 
         manual_white_threshold = st.slider(
@@ -266,29 +445,58 @@ if uploaded_file:
             1.0
         )
 
+        min_candidate_ratio = st.slider(
+            "最小候選褪色比例",
+            0.0,
+            0.10,
+            0.02,
+            0.005
+        )
+
+        radial_fill = st.checkbox(
+            "紅色外輪廓內部填滿",
+            value=True
+        )
+
+        show_candidate = st.checkbox(
+            "顯示候選褪色區",
+            value=False
+        )
+
     if use_manual:
-        result = analyze_two_zones(
+        result = analyze_two_zones_filled(
             img,
             circle_mask,
+            cx=cx,
+            cy=cy,
             white_threshold=manual_white_threshold,
-            white_bias=white_bias
+            white_bias=white_bias,
+            min_candidate_ratio=min_candidate_ratio,
+            radial_fill=radial_fill
         )
     else:
-        result = analyze_two_zones(
+        result = analyze_two_zones_filled(
             img,
             circle_mask,
+            cx=cx,
+            cy=cy,
             white_threshold=None,
-            white_bias=white_bias
+            white_bias=white_bias,
+            min_candidate_ratio=min_candidate_ratio,
+            radial_fill=radial_fill
         )
 
     st.write(f"White Score 閾值：**{result['white_threshold']:.2f}**")
+    st.write(f"候選褪色區比例：**{result['candidate_ratio']:.2%}**")
 
     overlay = make_overlay(
         img,
         circle_mask,
         blue_edge_mask,
         result["blue_mask"],
-        result["faded_mask"]
+        result["faded_mask"],
+        show_candidate=show_candidate,
+        candidate_faded=result["candidate_faded"]
     )
 
     st.subheader("4) AI 自動選區與分析結果")
@@ -312,5 +520,6 @@ if uploaded_file:
         f"- Total counted pixels：{result['total']}\n"
         f"- Blue ratio：{result['blue_ratio']:.4f}\n"
         f"- Faded white ratio：{result['faded_ratio']:.4f}\n"
-        f"- White Score threshold：{result['white_threshold']:.2f}"
+        f"- White Score threshold：{result['white_threshold']:.2f}\n"
+        f"- Candidate faded ratio：{result['candidate_ratio']:.4f}"
     )
